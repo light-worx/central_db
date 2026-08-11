@@ -8,12 +8,34 @@ so that the plugin can still *load* (and therefore still show up in the
 Plugin Manager) on machines where ``pymysql``/``mysql-connector`` has not
 been installed yet. The sync simply becomes a no-op with a logged warning
 in that case, instead of crashing plugin bootstrap.
+
+The local side of the sync uses the real ``Song``/``Author`` SQLAlchemy
+models from ``openlp.plugins.songs.lib.db`` -- not raw SQL -- because
+inserting a genuinely new, valid song needs more than filling in columns:
+the real schema has ``NOT NULL`` fields we don't otherwise touch
+(``search_lyrics``), and songs without at least one linked ``Author``
+don't display sensibly in OpenLP's own Songs list. Reusing the real model
+classes means we get that behaviour for free instead of re-implementing it.
+
+IDENTITY ACROSS INSTALLS: songs are matched between installs via a
+stable, install-independent UUID (see ``song_links.py``), not via
+``songs.sqlite``'s own primary key (which is only meaningful within a
+single install) or by title alone. Each local song gets a UUID minted
+the first time it's pushed; that UUID -- not ``local_id`` -- is the real
+identity key in the ``central_songs`` MySQL table.
+
+For any ``central_songs`` rows that already existed before this UUID
+scheme was introduced, :meth:`CentralSyncEngine._reconcile_links` adopts
+them into an install's local link store by matching on title, the first
+time each install syncs after upgrading. That's a one-time, best-effort
+step -- see its docstring for the caveat about duplicate titles.
 """
 
 import logging
-import sqlite3
 from contextlib import closing
 from pathlib import Path
+
+from .song_links import SongLinkStore, resolve_link_store_path
 
 log = logging.getLogger(__name__)
 
@@ -48,12 +70,17 @@ class CentralSyncEngine(object):
         to read the ``central_db/*`` configuration keys.
     :param songs_db_path: Path to the local ``songs.sqlite`` file. If not
         supplied, callers are expected to set it before calling :meth:`run`.
+    :param link_store_path: Path to this plugin's own local link-store
+        database (see ``song_links.py``). Defaults to
+        :func:`song_links.resolve_link_store_path` if not supplied.
     """
 
-    def __init__(self, settings, songs_db_path=None):
+    def __init__(self, settings, songs_db_path=None, link_store_path=None):
         self.settings = settings
         self.songs_db_path = Path(songs_db_path) if songs_db_path else None
-        self._mysql_conn = None
+        self.link_store_path = Path(link_store_path) if link_store_path else None
+        self._local_session = None
+        self._link_store = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -90,27 +117,41 @@ class CentralSyncEngine(object):
             log.warning('CentralDB: %s', message)
             return False, message
 
-        pushed = pulled = 0
+        pushed = 0
+        inserted = updated = 0
         try:
             with closing(mysql_conn):
-                if direction in (SyncDirection.PUSH, SyncDirection.BIDIRECTIONAL):
-                    pushed = self._push_local_to_central(mysql_conn)
-                if direction in (SyncDirection.PULL, SyncDirection.BIDIRECTIONAL):
-                    pulled = self._pull_central_to_local(mysql_conn)
+                local_session = self._get_local_session()
+                link_store = self._get_link_store()
+                try:
+                    # Adopt any pre-UUID-scheme central rows into this
+                    # install's link store before push/pull, so push
+                    # doesn't mint fresh UUIDs (and duplicate rows) for
+                    # songs that are already up there under the old
+                    # local_id-only scheme.
+                    self._reconcile_links(mysql_conn, local_session, link_store)
+                    if direction in (SyncDirection.PUSH, SyncDirection.BIDIRECTIONAL):
+                        pushed = self._push_local_to_central(mysql_conn, local_session, link_store)
+                    if direction in (SyncDirection.PULL, SyncDirection.BIDIRECTIONAL):
+                        inserted, updated = self._pull_central_to_local(mysql_conn, local_session, link_store)
+                finally:
+                    local_session.close()
+                    self._local_session = None
         except Exception as error:
             log.exception('CentralDB: sync failed, continuing without it.')
             return False, f'Sync failed: {error}'
 
-        message = f'Pushed {pushed} song(s), pulled {pulled} song(s).'
+        message = (f'Pushed {pushed} song(s). '
+                    f'Pulled {inserted} new, updated {updated} existing.')
         log.info('CentralDB: %s', message)
         return True, message
 
     def test_connection(self):
         """
         Attempt a MySQL connection using the current settings and
-        immediately close it again. Does not touch the local SQLite
-        database or run any sync. Intended for a "Test Connection"
-        button in the settings UI.
+        immediately close it again. Does not touch the local database or
+        run any sync. Intended for a "Test Connection" button in the
+        settings UI.
 
         :returns: a ``(success, message)`` tuple. ``message`` is a
             user-facing string in both the success and failure case.
@@ -156,104 +197,159 @@ class CentralSyncEngine(object):
             database=database, charset='utf8mb4', autocommit=False
         )
 
-    def _ensure_local_schema(self):
+    def _get_local_session(self):
         """
-        Make sure ``songs.sqlite`` exists and has the schema OpenLP's own
-        Songs plugin expects, using that plugin's own
-        ``openlp.plugins.songs.lib.db.init_schema`` function rather than
-        inventing our own smaller table.
+        Get (creating and caching if necessary) a SQLAlchemy session
+        bound to ``songs.sqlite``, using OpenLP's own Songs-plugin
+        ``init_schema`` function rather than raw SQL.
 
-        This matters because the real ``songs`` table has columns our
-        sync doesn't touch but that are ``NOT NULL`` (e.g.
-        ``search_lyrics``) -- a bare-bones table created independently
-        here would either conflict with, or silently diverge from, the
-        schema the Songs plugin creates for itself. Reusing its
-        ``init_schema`` means whichever plugin runs first creates
-        (or recognises) the exact same schema.
-
-        Safe to call on every sync: SQLAlchemy's
+        Calling ``init_schema`` also guarantees the database file and
+        schema exist -- see the module docstring for why we reuse the
+        Songs plugin's own schema-creation code instead of inventing our
+        own. Safe to call repeatedly: SQLAlchemy's
         ``metadata.create_all(checkfirst=True)`` is a no-op against a
         database that's already up to date.
         """
+        if self._local_session is not None:
+            return self._local_session
         if not self.songs_db_path:
-            return
+            raise RuntimeError('No local songs.sqlite path configured.')
         self.songs_db_path.parent.mkdir(parents=True, exist_ok=True)
         from openlp.plugins.songs.lib.db import init_schema as songs_init_schema
-        session = songs_init_schema(f'sqlite:///{self.songs_db_path}')
-        session.close()
+        self._local_session = songs_init_schema(f'sqlite:///{self.songs_db_path}')
+        return self._local_session
 
-    def _connect_sqlite(self):
-        if not self.songs_db_path:
-            log.warning('CentralDB: no local songs.sqlite path configured.')
-            return None
-        self._ensure_local_schema()
-        return sqlite3.connect(str(self.songs_db_path))
+    def _get_link_store(self):
+        """
+        Get (creating and caching if necessary) this install's
+        :class:`SongLinkStore`.
+        """
+        if self._link_store is not None:
+            return self._link_store
+        path = self.link_store_path or resolve_link_store_path()
+        self._link_store = SongLinkStore(path)
+        return self._link_store
 
-    def _push_local_to_central(self, mysql_conn):
-        sqlite_conn = self._connect_sqlite()
-        if sqlite_conn is None:
-            return 0
+    def _reconcile_links(self, mysql_conn, local_session, link_store):
+        """
+        One-time-per-song adoption pass for upgrading past installs: if
+        a central row has no link in this install's local link store yet
+        (most commonly because it predates the UUID scheme, or because
+        this is a different install that already has a matching song
+        locally), try to match it to a local song by ``search_title`` and
+        record that link -- rather than letting :meth:`_push_local_to_central`
+        mint a brand new UUID for what is actually the same song, which
+        would create a duplicate central row.
+
+        This is a best-effort heuristic, not a guarantee: two genuinely
+        different songs sharing an identical title will be treated as
+        the same song. It only runs once per song per install, though --
+        once a link exists, this is a cheap no-op for that row on every
+        subsequent sync.
+        """
+        from openlp.plugins.songs.lib.db import Song
+
+        with mysql_conn.cursor() as mcur:
+            mcur.execute('SELECT central_uuid, search_title FROM central_songs')
+            central_rows = mcur.fetchall()
+
+        for central_uuid, search_title in central_rows:
+            if link_store.has_link(central_uuid):
+                continue
+            local_song = local_session.query(Song).filter(
+                Song.search_title == search_title).first()
+            if local_song is not None:
+                link_store.set_link(local_song.id, central_uuid)
+
+    def _push_local_to_central(self, mysql_conn, local_session, link_store):
+        from openlp.plugins.songs.lib.db import Song
+
         editor = self.settings.value('central_db/editor_name') or 'unknown'
+        songs = local_session.query(Song).all()
         try:
-            with closing(sqlite_conn):
-                cur = sqlite_conn.execute(
-                    'SELECT id, title, alternate_title, search_title, '
-                    'lyrics, last_modified FROM songs'
-                )
-                rows = cur.fetchall()
-
             with mysql_conn.cursor() as mcur:
-                for (song_id, title, alt_title, search_title, lyrics,
-                     last_modified) in rows:
+                for song in songs:
+                    central_uuid = link_store.get_or_create_uuid(song.id)
                     mcur.execute(
                         """
                         INSERT INTO central_songs
-                            (local_id, title, alternate_title, search_title,
-                             lyrics, last_modified, last_editor)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (central_uuid, local_id, title, alternate_title,
+                             search_title, search_lyrics, lyrics,
+                             last_modified, last_editor)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
+                            local_id = VALUES(local_id),
                             title = VALUES(title),
                             alternate_title = VALUES(alternate_title),
                             search_title = VALUES(search_title),
+                            search_lyrics = VALUES(search_lyrics),
                             lyrics = VALUES(lyrics),
                             last_modified = VALUES(last_modified),
                             last_editor = VALUES(last_editor)
                         """,
-                        (song_id, title, alt_title, search_title, lyrics,
-                         last_modified, editor)
+                        (central_uuid, song.id, song.title, song.alternate_title,
+                         song.search_title, song.search_lyrics, song.lyrics,
+                         song.last_modified, editor)
                     )
             mysql_conn.commit()
-            return len(rows)
+            return len(songs)
         except Exception:
             mysql_conn.rollback()
             raise
 
-    def _pull_central_to_local(self, mysql_conn):
-        sqlite_conn = self._connect_sqlite()
-        if sqlite_conn is None:
-            return 0
-        try:
-            with mysql_conn.cursor() as mcur:
-                mcur.execute(
-                    'SELECT local_id, title, alternate_title, search_title, '
-                    'lyrics, last_modified FROM central_songs'
-                )
-                rows = mcur.fetchall()
+    def _pull_central_to_local(self, mysql_conn, local_session, link_store):
+        from openlp.plugins.songs.lib.db import Author, Song
+        from openlp.plugins.songs.lib.ui import SongStrings
 
-            with closing(sqlite_conn):
-                for (song_id, title, alt_title, search_title, lyrics,
-                     last_modified) in rows:
-                    sqlite_conn.execute(
-                        """
-                        UPDATE songs
-                        SET title = ?, alternate_title = ?,
-                            search_title = ?, lyrics = ?, last_modified = ?
-                        WHERE id = ?
-                        """,
-                        (title, alt_title, search_title, lyrics,
-                         last_modified, song_id)
-                    )
-                sqlite_conn.commit()
-            return len(rows)
-        except Exception:
-            raise
+        with mysql_conn.cursor() as mcur:
+            mcur.execute(
+                'SELECT central_uuid, title, alternate_title, search_title, '
+                'search_lyrics, lyrics, last_modified FROM central_songs'
+            )
+            rows = mcur.fetchall()
+
+        inserted = updated = 0
+        unknown_author_name = SongStrings().AuthorUnknown
+        new_links = []  # [(song_object, central_uuid), ...], linked after flush
+
+        for (central_uuid, title, alt_title, search_title, search_lyrics,
+             lyrics, last_modified) in rows:
+            local_id = link_store.get_local_id(central_uuid)
+            song = local_session.query(Song).get(local_id) if local_id is not None else None
+
+            if song is None:
+                song = Song()
+                # A newly-inserted song needs at least one author for
+                # OpenLP's Songs list to display it sensibly -- mirrors
+                # the fallback openlp.plugins.songs.lib.clean_song() uses
+                # for locally-created songs with no author.
+                author = local_session.query(Author).filter_by(
+                    display_name=unknown_author_name).first()
+                if author is None:
+                    author = Author(display_name=unknown_author_name,
+                                     last_name='', first_name='')
+                song.add_author(author)
+                local_session.add(song)
+                new_links.append((song, central_uuid))
+                inserted += 1
+            else:
+                updated += 1
+
+            song.title = title
+            song.alternate_title = alt_title
+            song.search_title = search_title
+            # search_lyrics is NOT NULL locally but wasn't part of the
+            # central schema until this column was added; guard against
+            # older rows that predate it.
+            song.search_lyrics = search_lyrics or ''
+            song.lyrics = lyrics
+            song.last_modified = last_modified
+
+        # Newly-created Song objects don't have their (autoincrement)
+        # local id until flushed -- link them only after that.
+        local_session.flush()
+        for song, central_uuid in new_links:
+            link_store.set_link(song.id, central_uuid)
+
+        local_session.commit()
+        return inserted, updated

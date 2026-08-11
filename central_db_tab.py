@@ -12,7 +12,7 @@ from PyQt5 import QtCore, QtWidgets
 from openlp.core.common.i18n import translate
 from openlp.core.lib.settingstab import SettingsTab
 
-from openlp.plugins.central_db.sync_engine import CentralSyncEngine, resolve_songs_db_path
+from .sync_engine import CentralSyncEngine, resolve_songs_db_path
 
 
 class CentralDBTab(SettingsTab):

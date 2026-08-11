@@ -38,8 +38,8 @@ from openlp.core.lib.ui import create_action
 from openlp.core.state import State
 from openlp.core.ui.icons import UiIcons
 
-from openlp.plugins.central_db.central_db_tab import CentralDBTab
-from openlp.plugins.central_db.sync_engine import CentralSyncEngine, resolve_songs_db_path
+from .central_db_tab import CentralDBTab
+from .sync_engine import CentralSyncEngine, resolve_songs_db_path
 
 log = logging.getLogger(__name__)
 
