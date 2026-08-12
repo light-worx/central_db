@@ -85,6 +85,14 @@ class CentralDBTab(SettingsTab):
         self.editor_edit.setObjectName('editor_edit')
         self.sync_layout.addRow(self.editor_label, self.editor_edit)
 
+        self.sync_on_startup_check_box = QtWidgets.QCheckBox(self.sync_group_box)
+        self.sync_on_startup_check_box.setObjectName('sync_on_startup_check_box')
+        self.sync_layout.addRow(self.sync_on_startup_check_box)
+
+        self.sync_on_shutdown_check_box = QtWidgets.QCheckBox(self.sync_group_box)
+        self.sync_on_shutdown_check_box.setObjectName('sync_on_shutdown_check_box')
+        self.sync_layout.addRow(self.sync_on_shutdown_check_box)
+
         self.left_layout.addWidget(self.sync_group_box)
         self.left_layout.addStretch()
 
@@ -124,6 +132,10 @@ class CentralDBTab(SettingsTab):
         self.sync_group_box.setTitle(
             translate('CentralDBPlugin.CentralDBTab', 'Sync Options'))
         self.editor_label.setText(translate('CentralDBPlugin.CentralDBTab', 'Editor name:'))
+        self.sync_on_startup_check_box.setText(
+            translate('CentralDBPlugin.CentralDBTab', 'Sync automatically when OpenLP starts'))
+        self.sync_on_shutdown_check_box.setText(
+            translate('CentralDBPlugin.CentralDBTab', 'Sync automatically when OpenLP exits'))
         self.test_button.setText(
             translate('CentralDBPlugin.CentralDBTab', 'Test Connection'))
         self.sync_now_button.setText(
@@ -154,6 +166,7 @@ class CentralDBTab(SettingsTab):
         self.save()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
+            self._wait_for_startup_sync()
             engine = CentralSyncEngine(
                 settings=self.settings, songs_db_path=resolve_songs_db_path())
             success, message = engine.run()
@@ -162,6 +175,23 @@ class CentralDBTab(SettingsTab):
         self.sync_status_label.setText(message)
         self.sync_status_label.setStyleSheet(
             'color: green;' if success else 'color: red;')
+
+    def _wait_for_startup_sync(self):
+        """
+        If the plugin's automatic background startup sync is still
+        running, wait briefly (max 5s) for it to finish before starting
+        this manual one -- otherwise both would write to the same local
+        songs.sqlite and link store at once. Looks the plugin instance
+        up via Registry() (every plugin self-registers under its
+        de-humped class name -- 'central_db_plugin' here -- the same
+        mechanism ``self.settings``/``self.main_window`` use elsewhere).
+        Best-effort: does nothing if the plugin instance can't be found.
+        """
+        from openlp.core.common.registry import Registry
+        plugin = Registry().get('central_db_plugin')
+        thread = getattr(plugin, '_startup_sync_thread', None)
+        if thread is not None and thread.isRunning():
+            thread.wait(5000)
 
     def load(self):
         """
@@ -173,6 +203,10 @@ class CentralDBTab(SettingsTab):
         self.password_edit.setText(self.settings.value('central_db/mysql_password'))
         self.database_edit.setText(self.settings.value('central_db/mysql_database'))
         self.editor_edit.setText(self.settings.value('central_db/editor_name'))
+        self.sync_on_startup_check_box.setChecked(
+            bool(self.settings.value('central_db/sync_on_startup')))
+        self.sync_on_shutdown_check_box.setChecked(
+            bool(self.settings.value('central_db/sync_on_shutdown')))
         self.status_label.setText('')
         self.sync_status_label.setText('')
 
@@ -186,6 +220,10 @@ class CentralDBTab(SettingsTab):
         self.settings.setValue('central_db/mysql_password', self.password_edit.text())
         self.settings.setValue('central_db/mysql_database', self.database_edit.text())
         self.settings.setValue('central_db/editor_name', self.editor_edit.text())
+        self.settings.setValue(
+            'central_db/sync_on_startup', self.sync_on_startup_check_box.isChecked())
+        self.settings.setValue(
+            'central_db/sync_on_shutdown', self.sync_on_shutdown_check_box.isChecked())
         if self.tab_visited:
             self.settings_form.register_post_process('central_db_config_updated')
         self.tab_visited = False

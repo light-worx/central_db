@@ -40,6 +40,7 @@ from openlp.core.ui.icons import UiIcons
 
 from .central_db_tab import CentralDBTab
 from .sync_engine import CentralSyncEngine, resolve_songs_db_path
+from .toast import show_toast
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,32 @@ __default_settings__ = {
     'central_db/mysql_password': '',
     'central_db/mysql_database': '',
     'central_db/editor_name': '',
+    'central_db/sync_on_startup': True,
+    'central_db/sync_on_shutdown': True,
 }
+
+
+class _SyncThread(QtCore.QThread):
+    """
+    Runs a :class:`CentralSyncEngine` sync off the UI thread.
+
+    Used specifically for the automatic *startup* sync, so OpenLP's main
+    window doesn't sit waiting on a MySQL round trip -- over a network
+    that might be slow, or a server that might be unreachable entirely
+    -- before it can appear. Not used for the shutdown sync: we want that
+    one to actually finish before the app exits, not race the shutdown
+    sequence (see ``CentralDBPlugin.finalise()``).
+    """
+
+    finished_sync = QtCore.pyqtSignal(bool, str)
+
+    def __init__(self, engine, parent=None):
+        super(_SyncThread, self).__init__(parent)
+        self.engine = engine
+
+    def run(self):
+        success, message = self.engine.run()
+        self.finished_sync.emit(success, message)
 
 
 class CentralDBPlugin(Plugin):
@@ -81,6 +107,8 @@ class CentralDBPlugin(Plugin):
         # CentralDBTab by the base class's create_settings_tab()).
         self.icon_path = UiIcons().database
         self.icon = build_icon(self.icon_path)
+        self._startup_sync_thread = None
+        self._active_toast = None
 
         self.settings.extend_default_settings(__default_settings__)
 
@@ -124,30 +152,91 @@ class CentralDBPlugin(Plugin):
 
     def initialise(self):
         super(CentralDBPlugin, self).initialise()
-        log.info('CentralDB: initialising, running startup sync.')
-        self._run_sync()
+        if not self.settings.value('central_db/sync_on_startup'):
+            log.info('CentralDB: automatic startup sync is disabled in settings.')
+            return
+        log.info('CentralDB: initialising, running startup sync in the background.')
+        engine = CentralSyncEngine(
+            settings=self.settings, songs_db_path=resolve_songs_db_path())
+        self._startup_sync_thread = _SyncThread(engine, parent=self)
+        self._startup_sync_thread.finished_sync.connect(self._on_startup_sync_finished)
+        self._startup_sync_thread.start()
+
+    def _on_startup_sync_finished(self, success, message):
+        self._report_sync_result(success, message)
+
+    def _wait_for_startup_sync(self):
+        """
+        Block briefly (max 5s) if the background startup sync is still
+        running, so a manual sync (Tools menu, or shutdown) doesn't race
+        it and write to the same local songs.sqlite / link store at the
+        same time.
+        """
+        if self._startup_sync_thread is not None and self._startup_sync_thread.isRunning():
+            log.info('CentralDB: waiting for startup sync to finish first.')
+            self._startup_sync_thread.wait(5000)
 
     def finalise(self):
-        log.info('CentralDB: finalising, running shutdown sync.')
-        self._run_sync()
+        self._wait_for_startup_sync()
+        if self.settings.value('central_db/sync_on_shutdown'):
+            log.info('CentralDB: finalising, running shutdown sync.')
+            self._run_sync()
         super(CentralDBPlugin, self).finalise()
 
     def _run_sync(self):
         """
-        Silent sync used by initialise()/finalise() (app startup and
-        shutdown). Logs the result rather than showing it -- for
-        feedback while working, use the Tools menu item or the
-        settings tab's "Sync Now" button instead.
+        Synchronous sync used by finalise() (app shutdown). Deliberately
+        not backgrounded, unlike the startup sync -- shutdown should
+        actually finish the sync before the app exits, not race it. The
+        MySQL connect timeout (see CentralSyncEngine) still bounds how
+        long a genuinely unreachable server can delay shutdown.
+
+        Logs the result rather than showing it -- for feedback while
+        working, use the Tools menu item or the settings tab's
+        "Sync Now" button instead.
         """
         try:
             engine = CentralSyncEngine(
                 settings=self.settings, songs_db_path=resolve_songs_db_path()
             )
             success, message = engine.run()
-            log.info('CentralDB: %s', message) if success else log.warning('CentralDB: %s', message)
+            self._report_sync_result(success, message)
         except Exception:
             # A sync failure must never block OpenLP startup/shutdown.
             log.exception('CentralDB: unexpected error running sync.')
+
+    def _report_sync_result(self, success, message):
+        """
+        Shared feedback for the automatic (startup/shutdown) syncs: log
+        it, post it to the status bar either way, and additionally show
+        a brief non-modal warning toast on failure -- a failed sync is
+        worth actually noticing rather than only turning up later in the
+        log, but a popup on every single successful background sync
+        would get old fast, so success stays quiet (status bar only).
+
+        Best-effort: any UI failure here (e.g. no main window yet) is
+        logged and swallowed rather than allowed to mask the sync result
+        itself, or crash startup/shutdown over a notification.
+        """
+        if success:
+            log.info('CentralDB: %s', message)
+        else:
+            log.warning('CentralDB: %s', message)
+
+        try:
+            self.main_window.show_status_message(
+                translate('CentralDBPlugin', 'Central DB sync: ') + message)
+        except Exception:
+            log.exception('CentralDB: could not show status bar message.')
+
+        if not success:
+            try:
+                self._active_toast = show_toast(
+                    self.main_window,
+                    translate('CentralDBPlugin', 'Central DB sync failed: ') + message,
+                    is_error=True)
+            except Exception:
+                log.exception('CentralDB: could not show failure toast.')
 
     # ------------------------------------------------------------------ #
     # Tools menu -- manual "Sync Now" trigger
@@ -179,6 +268,7 @@ class CentralDBPlugin(Plugin):
         """
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
+            self._wait_for_startup_sync()
             engine = CentralSyncEngine(
                 settings=self.settings, songs_db_path=resolve_songs_db_path())
             success, message = engine.run()

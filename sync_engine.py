@@ -178,6 +178,12 @@ class CentralSyncEngine(object):
                 return False
         return True
 
+    # Connect timeout for the automatic startup/shutdown sync in
+    # particular: without this, an unreachable host (wrong network, VPN
+    # down, server off) can hang far longer than a user waiting for
+    # OpenLP to open or close is willing to tolerate.
+    MYSQL_CONNECT_TIMEOUT_SECONDS = 5
+
     def _connect_mysql(self):
         try:
             import pymysql
@@ -194,7 +200,8 @@ class CentralSyncEngine(object):
 
         return pymysql.connect(
             host=host, port=port, user=user, password=password,
-            database=database, charset='utf8mb4', autocommit=False
+            database=database, charset='utf8mb4', autocommit=False,
+            connect_timeout=self.MYSQL_CONNECT_TIMEOUT_SECONDS
         )
 
     def _get_local_session(self):
